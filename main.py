@@ -7,180 +7,183 @@ from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from telethon import TelegramClient
 from telethon.sessions import StringSession
+from telethon.tl.types import Channel
 
-# --- 1. CONFIGURACIÓN Y VARIABLES ---
+# --- 1. CONFIGURACIÓN ---
 API_ID = int(os.getenv("API_ID", "0"))
 API_HASH = os.getenv("API_HASH", "")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "https://consulta-pe-bot.up.railway.app").rstrip("/")
 SESSION_STRING = os.getenv("SESSION_STRING", None)
 PORT = int(os.getenv("PORT", 8080))
 
-# CANAL OBJETIVO:
-CHANNEL_ID = 'peliculas_psicologicas'
+# Nombre exacto del canal (username)
+CHANNEL_USERNAME = 'peliculas_psicologicas'
 
 DOWNLOAD_DIR = "downloads"
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
-# --- 2. MOTOR DE TELEGRAM (ASYNCIO) ---
-# Creamos un loop global para evitar conflictos con Gunicorn/Fly.io
+# --- 2. CLIENTE TELEGRAM ---
 loop = asyncio.new_event_loop()
 asyncio.set_event_loop(loop)
 
 if not API_ID or not API_HASH or not SESSION_STRING:
-    raise Exception("❌ Error Crítico: Faltan las credenciales (API_ID, API_HASH, SESSION_STRING)")
+    raise Exception("❌ Faltan credenciales API_ID, API_HASH o SESSION_STRING")
 
-# Inicializamos el cliente
 client = TelegramClient(StringSession(SESSION_STRING), API_ID, API_HASH, loop=loop)
 
-async def ensure_connection():
+# Variable global para guardar la entidad del canal y no buscarla siempre
+cached_channel_entity = None
+
+async def get_channel_entity():
     """
-    Garantiza que la conexión con Telegram esté activa y el canal esté accesible.
+    Resuelve el canal y lo guarda en memoria. 
+    Es vital para que Telethon sepa dónde buscar.
     """
+    global cached_channel_entity
+    
     if not client.is_connected():
-        print("🔌 Conectando a los servidores de Telegram...")
         await client.connect()
     
-    # Pequeña pausa para estabilizar la conexión en entornos cloud (Fly.io)
-    await asyncio.sleep(1)
+    # Si ya lo tenemos en caché, retornamos rápido
+    if cached_channel_entity:
+        return cached_channel_entity
 
     try:
-        # Intentamos 'tocar' el canal para asegurar que Telethon lo tiene en caché
-        await client.get_input_entity(CHANNEL_ID)
+        print(f"🔄 Resolviendo entidad para: {CHANNEL_USERNAME}...")
+        # Buscamos por nombre de usuario
+        entity = await client.get_entity(CHANNEL_USERNAME)
+        cached_channel_entity = entity
+        print(f"✅ Canal localizado: {entity.title} (ID: {entity.id})")
+        return entity
     except Exception as e:
-        print(f"⚠️ Aviso: Resolviendo entidad del canal '{CHANNEL_ID}'... ({e})")
-        try:
-            await client.get_dialogs(limit=20)
-        except:
-            pass
+        print(f"⚠️ Error resolviendo canal directamente: {e}")
+        # Intento de emergencia: buscar en diálogos
+        async for dialog in client.iter_dialogs(limit=50):
+            if dialog.is_channel:
+                # Comparamos username o título
+                d_username = getattr(dialog.entity, 'username', '')
+                if d_username and d_username.lower() == CHANNEL_USERNAME.lower():
+                    cached_channel_entity = dialog.entity
+                    print(f"✅ Canal encontrado en diálogos: {dialog.title}")
+                    return dialog.entity
+        return None
 
-# --- 3. LÓGICA DE BÚSQUEDA ROBUSTA ---
+# --- 3. BÚSQUEDA ---
 async def search_movies_in_channel(search_query: str):
     try:
-        await ensure_connection()
-        
-        # Limpieza de la consulta
-        query = search_query.lower().strip()
+        # 1. Obtener el canal seguro
+        entity = await get_channel_entity()
+        if not entity:
+            print("❌ No se pudo encontrar el canal. Abortando búsqueda.")
+            return []
+
+        search_query = search_query.lower().strip()
         results = []
         
-        print(f"🚀 Iniciando búsqueda profunda de: '{query}' en {CHANNEL_ID}")
+        print(f"🔎 ESCANEANDO CANAL: {entity.title} buscando '{search_query}'")
         
-        # LÍMITE AUMENTADO A 1500: Para encontrar películas más antiguas
-        count_scanned = 0
-        async for message in client.iter_messages(CHANNEL_ID, limit=1500):
-            count_scanned += 1
-            
-            # Ignorar mensajes irrelevantes (sin texto y sin archivo)
+        # 2. Iterar mensajes (Límite 500 para velocidad)
+        # Usamos 'entity' directamente, no el string
+        count = 0
+        async for message in client.iter_messages(entity, limit=500):
+            count += 1
             if not message.text and not message.file:
                 continue
-            
-            # Variables de comparación
+
+            # Preparar textos para comparar
             text_content = (message.text or "").lower()
-            file_name = message.file.name.lower() if (message.file and message.file.name) else ""
+            file_name = ""
+            if message.file and message.file.name:
+                file_name = message.file.name.lower()
             
-            # LÓGICA DE COINCIDENCIA (Texto O Nombre de archivo)
-            match_found = (query in text_content) or (query in file_name)
-            
-            if match_found:
+            # LOG DE DEPURACIÓN (Verás esto en fly logs si encuentra algo)
+            # Solo imprimimos cada 50 mensajes para no saturar
+            if count % 50 == 0:
+                print(f"   ...Escaneado mensaje {count} (ID: {message.id})...")
+
+            # 3. Comparación
+            if search_query in text_content or search_query in file_name:
+                print(f"   ✨ ¡COINCIDENCIA ENCONTRADA! ID: {message.id}")
                 movie_info = extract_movie_info(message)
                 if movie_info:
                     results.append(movie_info)
-        
-        print(f"✅ Búsqueda finalizada. Escaneados: {count_scanned}. Encontrados: {len(results)}")
+
+        print(f"✅ Fin del escaneo. Total revisados: {count}. Encontrados: {len(results)}")
         return results
-        
+
     except Exception as e:
-        print(f"❌ Error fatal en búsqueda: {str(e)}")
-        # Intento de reconexión de emergencia para la próxima
-        try:
-            await client.disconnect()
-            await client.connect()
-        except:
-            pass
+        print(f"❌ Error CRÍTICO en búsqueda: {str(e)}")
+        # Si falla, limpiamos caché para forzar reconexión la próxima
+        global cached_channel_entity
+        cached_channel_entity = None
         return []
 
 def extract_movie_info(message):
-    """Extrae datos bonitos del mensaje o usa valores por defecto"""
     try:
         text = message.text or ""
-        
         info = {
             "message_id": message.id, 
-            "text_preview": text[:150] + "..." if len(text) > 150 else text
+            "text_preview": text[:100] + "..." if text else "Archivo multimedia"
         }
 
-        # Intentar sacar título limpio del archivo primero
+        # Intentar sacar título del nombre de archivo
         if message.file and message.file.name:
-            # Elimina extensión (.mp4) y caracteres raros (., _, -) para mostrarlo bonito
-            clean_name = os.path.splitext(message.file.name)[0]
-            clean_name = clean_name.replace(".", " ").replace("_", " ").replace("-", " ")
-            info["title"] = clean_name
+            clean = os.path.splitext(message.file.name)[0]
+            clean = clean.replace(".", " ").replace("_", " ")
+            info["title"] = clean
         
-        # Si no hay archivo, intentar Regex en el texto
+        # Si no, del texto
         if "title" not in info:
-            match = re.search(r"(?:Título|Movie)[:\-]\s*(.+?)(?:\n|$)", text, re.IGNORECASE)
-            if match:
-                info["title"] = match.group(1).strip()
-            else:
-                # Fallback final: Primera línea del texto
-                info["title"] = text.split('\n')[0][:60] if text else f"Video {message.id}"
-
-        # Datos extra
-        info["size"] = f"{message.file.size / 1024 / 1024:.1f} MB" if message.file else "N/A"
+            first_line = text.split('\n')[0] if text else f"Video {message.id}"
+            info["title"] = first_line[:50]
+        
+        # Tamaño
+        if message.file:
+            size_mb = message.file.size / (1024 * 1024)
+            info["size"] = f"{size_mb:.2f} MB"
         
         return info
     except:
         return None
 
-# --- 4. LÓGICA DE DESCARGA ---
+# --- 4. DESCARGA ---
 async def download_movie_content(message_id):
     try:
-        await ensure_connection()
-        message = await client.get_messages(CHANNEL_ID, ids=message_id)
-        
+        entity = await get_channel_entity()
+        if not entity:
+            return None
+
+        message = await client.get_messages(entity, ids=message_id)
         if not message or not message.media:
             return None
         
-        # Definir nombre del archivo
-        original_name = "video_download"
+        # Nombre de archivo
+        original_name = "video"
         ext = ".mp4"
-        
         if message.file:
-            if message.file.name:
-                original_name = message.file.name
-            if message.file.ext:
-                ext = message.file.ext
+            if message.file.name: original_name = message.file.name
+            if message.file.ext: ext = message.file.ext
 
-        # Sanitizar nombre (Quitar caracteres prohibidos en Linux/Windows)
-        safe_name = re.sub(r'[\\/*?:"<>|]', "", original_name)
-        safe_name = safe_name.replace(" ", "_") # Espacios a guiones bajos para URL segura
-        
-        # Timestamp para que sea único
+        safe_name = re.sub(r'[\\/*?:"<>|]', "", original_name).replace(" ", "_")
         file_name = f"{int(time.time())}_{safe_name}"
-        if not file_name.endswith(ext):
-            file_name += ext
+        if not file_name.endswith(ext): file_name += ext
 
         file_path = os.path.join(DOWNLOAD_DIR, file_name)
         
-        print(f"⬇️ Descargando archivo: {file_name}...")
+        print(f"⬇️ Descargando: {file_name}")
         path = await client.download_media(message, file=file_path)
         
         if path:
-            print("✅ Descarga exitosa.")
-            return {
-                "url": f"{PUBLIC_URL}/files/{file_name}", 
-                "file_name": file_name,
-                "size_mb": f"{os.path.getsize(file_path)/1024/1024:.2f}"
-            }
+            return {"url": f"{PUBLIC_URL}/files/{file_name}", "file_name": file_name}
         return None
     except Exception as e:
-        print(f"❌ Error en descarga: {e}")
+        print(f"❌ Error descarga: {e}")
         return None
 
-# --- 5. SERVIDOR FLASK ---
+# --- 5. SERVER ---
 app = Flask(__name__)
 CORS(app)
 
-# Helper para ejecutar funciones async dentro de Flask
 def run_async(coro):
     return loop.run_until_complete(coro)
 
@@ -188,46 +191,37 @@ def run_async(coro):
 def search():
     query = request.args.get("q", "").strip()
     if not query:
-        return jsonify({"error": "Debes enviar el parámetro 'q'. Ejemplo: /search?q=batman"}), 400
+        return jsonify({"error": "Falta parametro q"}), 400
     
     results = run_async(search_movies_in_channel(query))
     
     return jsonify({
         "status": "success", 
-        "query": query,
-        "count": len(results),
-        "results": results
+        "target": CHANNEL_USERNAME,
+        "results": results, 
+        "count": len(results)
     })
 
 @app.route("/download/<int:message_id>", methods=["GET"])
 def download(message_id):
     result = run_async(download_movie_content(message_id))
     if not result:
-        return jsonify({"error": "No se pudo descargar. Verifica que el ID sea correcto."}), 404
+        return jsonify({"error": "Error descargando"}), 404
     return jsonify(result)
 
 @app.route("/files/<path:filename>")
 def get_file(filename):
     return send_from_directory(DOWNLOAD_DIR, filename)
 
-@app.route("/health")
-def health():
-    return jsonify({"status": "ok", "time": datetime.now().isoformat()})
-
 @app.route("/")
 def index():
-    return jsonify({
-        "msg": "API de Películas Activa 🟢", 
-        "channel": CHANNEL_ID,
-        "instructions": "Usa /search?q=nombre para buscar."
-    })
+    return jsonify({"status": "API Online", "channel": CHANNEL_USERNAME})
 
 if __name__ == "__main__":
-    print("🚀 Arrancando Servidor...")
-    # Intento de conexión inicial
+    print("🚀 Iniciando Servidor...")
     try:
-        loop.run_until_complete(ensure_connection())
+        loop.run_until_complete(get_channel_entity())
     except Exception as e:
-        print(f"⚠️ La conexión inicial falló (se reintentará en la búsqueda): {e}")
-
+        print(f"⚠️ Aviso inicio: {e}")
+    
     app.run(host="0.0.0.0", port=PORT)
